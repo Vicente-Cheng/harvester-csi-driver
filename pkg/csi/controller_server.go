@@ -55,6 +55,7 @@ func NewControllerServer(coreClient ctlv1.Interface, storageClient ctlstoragev1.
 		accessModes: getVolumeCapabilityAccessModes(
 			[]csi.VolumeCapability_AccessMode_Mode{
 				csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 			}),
 	}
 }
@@ -86,7 +87,6 @@ func (cs *ControllerServer) validStorageClass(storageClassName string) error {
 
 func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	logrus.Infof("ControllerServer create volume req: %v", req)
-	targetSC := cs.hostStorageClass
 
 	if err := cs.validateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		logrus.Errorf("CreateVolume: invalid create volume req: %v", req)
@@ -98,6 +98,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, "Volume Name cannot be empty")
 	}
 	volumeCaps := req.GetVolumeCapabilities()
+	logrus.Debugf("Getting volumeCapabilities: %+v", volumeCaps)
 	if err := cs.validateVolumeCapabilities(volumeCaps); err != nil {
 		return nil, err
 	}
@@ -114,39 +115,7 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.Unimplemented, "")
 	}
 
-	// Create a PVC from the host cluster
-	volumeMode := corev1.PersistentVolumeBlock
-	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cs.namespace,
-			Name:      req.Name,
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
-			VolumeMode:  &volumeMode,
-		},
-	}
-
-	/*
-	 * Let's handle SC
-	 * SC define > controller define
-	 *
-	 * Checking mechanism:
-	 * 1. If guest cluster is not be allowed to list host cluster StorageClass, just continue.
-	 * 2. If guest cluster can list host cluster StorageClass, check it.
-	 */
-	if val, exists := volumeParameters[paramHostSC]; exists {
-		//If StorageClass has `hostStorageClass` parameter, check whether it is valid or not.
-		if err := cs.validStorageClass(val); err != nil {
-			return nil, err
-		}
-		targetSC = val
-	}
-	if targetSC != "" {
-		pvc.Spec.StorageClassName = pointer.StringPtr(targetSC)
-		logrus.Infof("Set up the target StorageClass to : %s", *pvc.Spec.StorageClassName)
-	}
-	logrus.Debugf("The PVC content wanted is: %+v", pvc)
+	// volumeSize handling
 	volSizeBytes := int64(util.MinimalVolumeSize)
 	if req.GetCapacityRange() != nil {
 		volSizeBytes = req.GetCapacityRange().GetRequiredBytes()
@@ -155,13 +124,13 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 		logrus.Warnf("Request volume %v size %v is smaller than minimal size %v, set it to minimal size.", req.Name, volSizeBytes, util.MinimalVolumeSize)
 		volSizeBytes = util.MinimalVolumeSize
 	}
-	// Round up to multiple of 2 * 1024 * 1024
-	volSizeBytes = util.RoundUpSize(volSizeBytes)
-	pvc.Spec.Resources = corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceStorage: *resource.NewQuantity(volSizeBytes, resource.BinarySI),
-		},
+
+	// Create a PVC from the host cluster
+	pvc, err := cs.generateHostClusterPVCFormat(req.Name, volumeCaps, volumeParameters, volSizeBytes)
+	if err != nil {
+		return nil, err
 	}
+	logrus.Debugf("The PVC content wanted is: %+v", pvc)
 
 	resPVC, err := cs.coreClient.PersistentVolumeClaim().Create(pvc)
 	if err != nil {
@@ -430,32 +399,6 @@ func (cs *ControllerServer) validateVolumeCapabilities(volumeCaps []*csi.VolumeC
 	return nil
 }
 
-func getControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) []*csi.ControllerServiceCapability {
-	var cscs = make([]*csi.ControllerServiceCapability, len(cl))
-
-	for _, cap := range cl {
-		logrus.Infof("Enabling controller service capability: %v", cap.String())
-		cscs = append(cscs, &csi.ControllerServiceCapability{
-			Type: &csi.ControllerServiceCapability_Rpc{
-				Rpc: &csi.ControllerServiceCapability_RPC{
-					Type: cap,
-				},
-			},
-		})
-	}
-
-	return cscs
-}
-
-func getVolumeCapabilityAccessModes(vc []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
-	var vca = make([]*csi.VolumeCapability_AccessMode, len(vc))
-	for _, c := range vc {
-		logrus.Infof("Enabling volume access mode: %v", c.String())
-		vca = append(vca, &csi.VolumeCapability_AccessMode{Mode: c})
-	}
-	return vca
-}
-
 func (cs *ControllerServer) waitForPVCState(name string, stateDescription string,
 	predicate func(pvc *corev1.PersistentVolumeClaim) bool) bool {
 	timer := time.NewTimer(timeoutAttachDetach)
@@ -483,4 +426,94 @@ func (cs *ControllerServer) waitForPVCState(name string, stateDescription string
 			}
 		}
 	}
+}
+
+func (cs *ControllerServer) generateHostClusterPVCFormat(name string, volCaps []*csi.VolumeCapability, volumeParameters map[string]string, volSizeBytes int64) (*corev1.PersistentVolumeClaim, error) {
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: cs.namespace,
+			Name:      name,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+		},
+	}
+
+	volumeMode := cs.getVolumeModule(volCaps)
+	targetSC, err := cs.getStorageClass(volumeParameters)
+	if err != nil {
+		logrus.Errorf("Failed to get the StorageClass: %v", err)
+		return nil, err
+	}
+	// Round up to multiple of 2 * 1024 * 1024
+	volSizeBytes = util.RoundUpSize(volSizeBytes)
+
+	pvc.Spec.VolumeMode = &volumeMode
+	if targetSC != "" {
+		pvc.Spec.StorageClassName = pointer.StringPtr(targetSC)
+	}
+	pvc.Spec.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceStorage: *resource.NewQuantity(volSizeBytes, resource.BinarySI),
+		},
+	}
+	return pvc, nil
+}
+
+func (cs *ControllerServer) getVolumeModule(volCaps []*csi.VolumeCapability) corev1.PersistentVolumeMode {
+	for _, volCap := range volCaps {
+		if volCap.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
+			return corev1.PersistentVolumeFilesystem
+		}
+		if volCap.GetAccessMode().GetMode() == csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER {
+			return corev1.PersistentVolumeBlock
+		}
+	}
+	return ""
+}
+
+func (cs *ControllerServer) getStorageClass(volParameters map[string]string) (string, error) {
+	/*
+	 * Let's handle SC
+	 * SC define > controller define
+	 *
+	 * Checking mechanism:
+	 * 1. If guest cluster is not be allowed to list host cluster StorageClass, just continue.
+	 * 2. If guest cluster can list host cluster StorageClass, check it.
+	 */
+	targetSC := cs.hostStorageClass
+	if val, exists := volParameters[paramHostSC]; exists {
+		//If StorageClass has `hostStorageClass` parameter, check whether it is valid or not.
+		if err := cs.validStorageClass(val); err != nil {
+			return "", err
+		}
+		targetSC = val
+	}
+	return targetSC, nil
+}
+
+func getControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) []*csi.ControllerServiceCapability {
+	var cscs = make([]*csi.ControllerServiceCapability, len(cl))
+
+	for _, cap := range cl {
+		logrus.Infof("Enabling controller service capability: %v", cap.String())
+		cscs = append(cscs, &csi.ControllerServiceCapability{
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: cap,
+				},
+			},
+		})
+	}
+
+	return cscs
+}
+
+func getVolumeCapabilityAccessModes(vc []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
+	var vca = make([]*csi.VolumeCapability_AccessMode, len(vc))
+	for _, c := range vc {
+		logrus.Infof("Enabling volume access mode: %v", c.String())
+		vca = append(vca, &csi.VolumeCapability_AccessMode{Mode: c})
+	}
+	return vca
 }
