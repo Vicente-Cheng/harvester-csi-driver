@@ -44,7 +44,7 @@ replace (
 )
 
 require (
-	github.com/container-storage-interface/spec v1.5.0
+	github.com/container-storage-interface/spec v1.8.0
 	github.com/kubernetes-csi/csi-lib-utils v0.7.0
 	github.com/longhorn/longhorn-manager v1.1.2
 	github.com/pkg/errors v0.9.1
