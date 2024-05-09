@@ -222,6 +222,14 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 			req.GetVolumeId(), pvc.Status.Phase)
 	}
 
+	//logrus.Infof("[VICENTE DBG]: caps: %+v", volumeCapability)
+	//logrus.Infof("[VICENTE DBG]: pvc: %+v", pvc)
+	// do no-op here with RWX volume
+	if volumeCapability.AccessMode.GetMode() == csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER {
+		logrus.Infof("Volume %s is ReadWriteMany, no need to attach", req.GetVolumeId())
+		return &csi.ControllerPublishVolumeResponse{}, nil
+	}
+
 	opts := &kubevirtv1.AddVolumeOptions{
 		Name: req.VolumeId,
 		Disk: &kubevirtv1.Disk{
@@ -278,6 +286,21 @@ func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 		Name: req.VolumeId,
 	}
 	if err := cs.virtSubresourceRestClient.VirtualMachine(cs.namespace).RemoveVolume(req.GetNodeId(), opts); err != nil {
+		vmi, err := cs.virtSubresourceRestClient.VirtualMachineInstance(cs.namespace).Get(req.GetNodeId(), &metav1.GetOptions{})
+		if err == nil {
+			// check if vmi does not contain this volume
+			volumeHotplugged := false
+			for _, volStatus := range vmi.Status.VolumeStatus {
+				if volStatus.Name == req.VolumeId && volStatus.HotplugVolume != nil {
+					volumeHotplugged = true
+					break
+				}
+			}
+			if !volumeHotplugged {
+				logrus.Infof("Volume %s is not attached to node %s, skip Unpublish!", req.GetVolumeId(), req.GetNodeId())
+				return &csi.ControllerUnpublishVolumeResponse{}, nil
+			}
+		}
 		return nil, status.Errorf(codes.Internal, "Failed to remove volume %v from node %s: %v", req.VolumeId, req.GetNodeId(), err)
 	}
 

@@ -73,12 +73,13 @@ func (m *Manager) Run(cfg *config.Config) error {
 		return err
 	}
 
-	virtSubresourceClient, err := kubecli.GetKubevirtSubresourceClientFromFlags("", cfg.KubeConfig)
-	if err != nil {
-		return err
-	}
+	//virtSubresourceClient, err := kubecli.GetKubevirtSubresourceClientFromFlags("", cfg.KubeConfig)
+	//if err != nil {
+	//	return err
+	//}
 
 	nodeID := cfg.NodeID
+	logrus.Infof("[VICENTE DBG]: API endpoint: %v", restConfig.Host)
 
 	ifaces, err := sysfsnet.Interfaces()
 	if err != nil {
@@ -107,8 +108,9 @@ func (m *Manager) Run(cfg *config.Config) error {
 	}
 
 	m.ids = NewIdentityServer(driverName, version.FriendlyVersion())
-	m.ns = NewNodeServer(coreClient.Core().V1(), virtClient, nodeID, namespace)
-	m.cs = NewControllerServer(coreClient.Core().V1(), storageClient.Storage().V1(), virtSubresourceClient, namespace, cfg.HostStorageClass)
+	m.ns = NewNodeServer(coreClient.Core().V1(), virtClient, nodeID, namespace, restConfig.Host)
+	//m.cs = NewControllerServer(coreClient.Core().V1(), storageClient.Storage().V1(), virtSubresourceClient, namespace, cfg.HostStorageClass)
+	m.cs = NewControllerServer(coreClient.Core().V1(), storageClient.Storage().V1(), virtClient, namespace, cfg.HostStorageClass)
 
 	// Create GRPC servers
 	s := NewNonBlockingGRPCServer()
